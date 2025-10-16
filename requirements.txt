@@ -1,0 +1,16 @@
+google-adk
+streamlit
+streamlit-drawable-canvas
+pillow
+beautifulsoup4
+requests
+aiofiles
+python-dotenv
+
+# Browser-Use integration (optional but recommended for Python 3.11+)
+# Provides advanced web scraping with AI automation
+# Note: Requires Python >= 3.11
+# If using Python 3.10, browser-use will be disabled automatically
+browser-use>=0.8.0; python_version >= '3.11'
+playwright>=1.40.0
+langchain-google-genai>=2.0.0
