@@ -11,7 +11,7 @@ def classify_user_intent(
     Returns: (agent_name, confidence_score)
     
     Agent mapping:
-    - "visual": VisualAgent (Furniture Placement + Virtual Try-on)
+    - "visual": VisualAgent (Furniture Placement + Virtual Try-on with 2 images)
     - "unclear": Need 2 images
     """
     msg = user_message.lower()

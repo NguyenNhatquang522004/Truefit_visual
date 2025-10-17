@@ -1,9 +1,8 @@
 # THÔNG TIN SẢN PHẨM
 
 ## 1. Tên sản phẩm
-**SmartHome Preview: AI-Powered Interior Design & Fashion Visualization System**
+**truefit_visual**
 
-*Tên tiếng Việt:* **Hệ thống Trực quan hóa Nội thất & Thời trang Thông minh bằng AI**
 
 ---
 

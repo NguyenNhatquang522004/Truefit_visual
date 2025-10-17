@@ -36,29 +36,41 @@ async def remove_and_place_object(
     tool_context: ToolContext,
     inputs: RemoveAndPlaceObjectInput
 ) -> str:
-    """Two-step: Remove object → Place furniture using Gemini image generation"""
+    """Smart placement: Auto-detect if removal needed, then place furniture using Gemini image generation"""
     client = get_genai_client()
     
     try:
         room_img = await tool_context.load_artifact(inputs.room_image_filename)
         furniture_img = await tool_context.load_artifact(inputs.furniture_image_filename)
         
-        # Step 1: Removal (support both coordinate-based and prompt-based)
-        coords = json.loads(inputs.mask_coordinates) if inputs.mask_coordinates and inputs.mask_coordinates != "{}" else None
+        # SMART DETECTION: Check if user wants to REMOVE first or just ADD directly
+        user_request = (inputs.removal_prompt + " " + inputs.placement_description).lower()
         
-        if coords and all(k in coords for k in ['x', 'y', 'width', 'height']):
-            # Coordinate-based removal (old method)
-            removal_prompt = f"""Remove the object at coordinates x={coords['x']}, y={coords['y']}, 
-            width={coords['width']}, height={coords['height']}. Fill the area naturally to match 
-            the surrounding environment. Maintain original lighting and perspective."""
-        else:
-            # Prompt-based removal - UNIVERSAL DETAILED TEMPLATE for ALL objects
-            removal_text = inputs.removal_prompt if inputs.removal_prompt else "Remove the main object"
+        # Keywords that indicate REPLACEMENT (need removal first)
+        replace_keywords = ["thay", "replace", "xóa", "remove", "đổi", "change", "swap"]
+        # Keywords that indicate DIRECT ADDITION (no removal needed)
+        add_keywords = ["thêm", "add", "đặt", "place", "put", "đưa vào"]
+        
+        needs_removal = any(kw in user_request for kw in replace_keywords)
+        direct_add = any(kw in user_request for kw in add_keywords) and not needs_removal
+        
+        # Step 1: Removal (ONLY if needed)
+        removed_img = None
+        
+        if needs_removal:
+            coords = json.loads(inputs.mask_coordinates) if inputs.mask_coordinates and inputs.mask_coordinates != "{}" else None
             
-            # UNIVERSAL DETAILED REMOVAL - Works for ANY object type
-            removal_prompt = f"""CRITICAL INSTRUCTION: {removal_text} COMPLETELY from this image.
-
-UNIVERSAL OBJECT REMOVAL PROCESS (Applies to ALL objects):
+            if coords and all(k in coords for k in ['x', 'y', 'width', 'height']):
+                # Coordinate-based removal (old method)
+                removal_prompt = f"""Remove the object at coordinates x={coords['x']}, y={coords['y']}, 
+                width={coords['width']}, height={coords['height']}. Fill the area naturally to match 
+                the surrounding environment. Maintain original lighting and perspective."""
+            else:
+                # Prompt-based removal - UNIVERSAL DETAILED TEMPLATE for ALL objects
+                removal_text = inputs.removal_prompt if inputs.removal_prompt else "Remove the main object"
+                
+                # UNIVERSAL DETAILED REMOVAL - Works for ANY object type
+                removal_prompt = f"""CRITICAL INSTRUCTION: {removal_text} COMPLETELY from this image.UNIVERSAL OBJECT REMOVAL PROCESS (Applies to ALL objects):
 
 STEP 1 - IDENTIFY THE ENTIRE OBJECT:
 • Detect the COMPLETE boundary of the object mentioned
@@ -122,37 +134,51 @@ EXAMPLES (This process works for):
 - Decorations: plant, vase, picture frame, lamp
 - Animals: dog, cat, bird, pet
 - ANY other object user specifies"""
-        
-        contents = [types.Content(role="user", parts=[
-            types.Part(text=removal_prompt), room_img
-        ])]
-        
-        removed_img = None
-        for chunk in client.models.generate_content_stream(
-            model="gemini-2.5-flash-image",
-            contents=contents,
-            config=types.GenerateContentConfig(response_modalities=["IMAGE"])
-        ):
-            if chunk.candidates and chunk.candidates[0].content.parts:
-                part = chunk.candidates[0].content.parts[0]
-                if part.inline_data:
-                    removed_img = types.Part(inline_data=part.inline_data)
-        
-        if not removed_img:
-            return "❌ Step 1 FAILED: Could not remove object. AI did not generate removal image."
-        
-        # Optional: Save intermediate removal image for debugging
-        if hasattr(tool_context, 'output_dir'):
-            debug_filename = f"{inputs.asset_name}_step1_removal_debug.png"
-            try:
-                await tool_context.save_artifact(debug_filename, removed_img)
-            except:
-                pass  # Non-critical, continue even if debug save fails
+            
+            contents = [types.Content(role="user", parts=[
+                types.Part(text=removal_prompt), room_img
+            ])]
+            
+            chunk_count = 0
+            for chunk in client.models.generate_content_stream(
+                model="gemini-2.5-flash-image",
+                contents=contents,
+                config=types.GenerateContentConfig(response_modalities=["IMAGE"])
+            ):
+                chunk_count += 1
+                try:
+                    # Safe check for chunk structure
+                    if chunk.candidates and len(chunk.candidates) > 0:
+                        candidate = chunk.candidates[0]
+                        if candidate.content and candidate.content.parts:
+                            part = candidate.content.parts[0]
+                            if part.inline_data:
+                                removed_img = types.Part(inline_data=part.inline_data)
+                except AttributeError as e:
+                    # Log but continue - some chunks may not have expected structure
+                    print(f"Warning: Chunk {chunk_count} structure issue: {str(e)}")
+                    continue
+            
+            if not removed_img:
+                return f"❌ Step 1 FAILED: Could not remove object. Processed {chunk_count} chunks but no image generated."
+            
+            # Optional: Save intermediate removal image for debugging
+            if hasattr(tool_context, 'output_dir'):
+                debug_filename = f"{inputs.asset_name}_step1_removal_debug.png"
+                try:
+                    await tool_context.save_artifact(debug_filename, removed_img)
+                except:
+                    pass  # Non-critical, continue even if debug save fails
+        else:
+            # Direct addition - no removal needed, use original room image
+            removed_img = room_img
         
         # Step 2: Placement - UNIVERSAL DETAILED TEMPLATE for ANY object
+        context_description = "a scene where an object has been removed, leaving empty space" if needs_removal else "an existing scene/room"
+        
         placement_prompt = f"""CRITICAL INSTRUCTION: Place the object from the second image {inputs.placement_description}.
 
-CONTEXT: The first image shows a scene where an object has been removed, leaving empty space.
+CONTEXT: The first image shows {context_description}.
 
 UNIVERSAL OBJECT PLACEMENT PROCESS (Works for ALL objects):
 
@@ -303,14 +329,17 @@ EXAMPLES (This process works for placing):
             contents=final_contents,
             config=types.GenerateContentConfig(response_modalities=["IMAGE"])
         ):
-            if chunk.candidates and chunk.candidates[0].content.parts:
-                part = chunk.candidates[0].content.parts[0]
-                if part.inline_data:
-                    await tool_context.save_artifact(
-                        filename=filename,
-                        artifact=types.Part(inline_data=part.inline_data)
-                    )
-                    return f"✅ Successfully saved: {filename}"
+            # Safe check for chunk structure
+            if chunk.candidates and len(chunk.candidates) > 0:
+                candidate = chunk.candidates[0]
+                if candidate.content and candidate.content.parts:
+                    part = candidate.content.parts[0]
+                    if part.inline_data:
+                        await tool_context.save_artifact(
+                            filename=filename,
+                            artifact=types.Part(inline_data=part.inline_data)
+                        )
+                        return f"✅ Successfully saved: {filename}"
         
         return "❌ Failed to place furniture. Please try again."
     
@@ -363,14 +392,17 @@ async def virtual_tryon(
             contents=contents,
             config=types.GenerateContentConfig(response_modalities=["IMAGE"], temperature=0.3)
         ):
-            if chunk.candidates and chunk.candidates[0].content.parts:
-                part = chunk.candidates[0].content.parts[0]
-                if part.inline_data:
-                    await tool_context.save_artifact(
-                        filename=filename,
-                        artifact=types.Part(inline_data=part.inline_data)
-                    )
-                    return f"✅ Successfully saved: {filename}"
+            # Safe check for chunk structure
+            if chunk.candidates and len(chunk.candidates) > 0:
+                candidate = chunk.candidates[0]
+                if candidate.content and candidate.content.parts:
+                    part = candidate.content.parts[0]
+                    if part.inline_data:
+                        await tool_context.save_artifact(
+                            filename=filename,
+                            artifact=types.Part(inline_data=part.inline_data)
+                        )
+                        return f"✅ Successfully saved: {filename}"
         
         return "❌ Failed to apply clothing. Please try again."
     
@@ -379,17 +411,7 @@ async def virtual_tryon(
 
 # === HELPER FUNCTIONS ===
 def get_next_version_number(tool_context: ToolContext, asset_name: str) -> int:
-    """Get next version number for artifact filename"""
-    try:
-        artifacts = tool_context.list_artifacts()
-        version = 1
-        for a in artifacts:
-            if asset_name in a:
-                try:
-                    v = int(a.split('_v')[1].split('.')[0])
-                    version = max(version, v + 1)
-                except:
-                    pass
-        return version
-    except:
-        return 1
+    """Get next version number for artifact filename - simplified to always use v1"""
+    # Simplified: Always use v1, file will be overwritten
+    # This avoids async issues with list_artifacts()
+    return 1
